@@ -21,12 +21,13 @@
 #include <unistd.h>
 #include <poll.h>
 #include <pthread.h>
+#include <errno.h>
+#include <cutils/log.h>
 
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/queue.h>
 #include <linux/netlink.h>
-
 
 LIST_HEAD(uevent_handler_head, uevent_handler) uevent_handler_list;
 pthread_mutex_t uevent_handler_list_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -45,23 +46,41 @@ int uevent_init()
     struct sockaddr_nl addr;
     int sz = 64*1024;
     int s;
+	int i = 0;
+	int ret = 0;
+	int pid = 0;
+	int online = 1;
 
+	pid = getpid();
     memset(&addr, 0, sizeof(addr));
     addr.nl_family = AF_NETLINK;
-    addr.nl_pid = getpid();
+    addr.nl_pid = pid;
     addr.nl_groups = 0xffffffff;
 
     s = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_KOBJECT_UEVENT);
-    if(s < 0)
+    if(s < 0) {
+		ALOGE("%s creat socket fail, err %s, pid %d", __FUNCTION__, strerror(errno), getpid());
         return 0;
+	}
 
-    setsockopt(s, SOL_SOCKET, SO_RCVBUFFORCE, &sz, sizeof(sz));
+	setsockopt(s, SOL_SOCKET, SO_RCVBUFFORCE, &sz, sizeof(sz));
+	setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &online, sizeof(online));
 
-    if(bind(s, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
-        close(s);
-        return 0;
-    }
+	for (i=1; i<1024; i++) {
+		if(ret = bind(s, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+			ALOGE("\n%s bind socket fail err %s , pid-%d uid-%d gid-%d \n",
+						__FUNCTION__, strerror(errno), getpid(), getuid(), getgid());
+			addr.nl_pid = pid + i;
+		} else
+			break;
+	}
 
+	if (ret < 0) {
+		close(s);
+		return 0;
+	}
+
+	ALOGD("%s bind socket sceess, fd %d", __FUNCTION__, s);
     fd = s;
     return (fd > 0);
 }

@@ -25,6 +25,7 @@
 #include <poll.h>
 
 #include "hardware_legacy/wifi.h"
+#include "hardware_legacy/wifi_hardware_info.h"
 #ifdef LIBWPA_CLIENT_EXISTS
 #include "libwpa_client/wpa_ctrl.h"
 #endif
@@ -42,6 +43,7 @@
 extern int do_dhcp();
 extern int ifc_init();
 extern void ifc_close();
+extern int ifc_disable(const char *ifname);
 extern char *dhcp_lasterror();
 extern void get_dhcp_info();
 extern int init_module(void *, unsigned long, const char *);
@@ -97,7 +99,12 @@ static char primary_iface[PROPERTY_VALUE_MAX];
 #endif
 
 #define WIFI_DRIVER_LOADER_DELAY	1000000
-
+#ifndef WIFI_DRIVER_MODULE_NAME
+#define WIFI_DRIVER_MODULE_NAME "bcmdhd"
+#endif
+#ifndef WIFI_DRIVER_MODULE_PATH
+#define WIFI_DRIVER_MODULE_PATH "/system/vendor/modules/"
+#endif
 static const char IFACE_DIR[]           = "/data/system/wpa_supplicant";
 #ifdef WIFI_DRIVER_MODULE_PATH
 static const char DRIVER_MODULE_NAME[]  = WIFI_DRIVER_MODULE_NAME;
@@ -216,6 +223,7 @@ int wifi_change_driver_state(const char *state)
 
 int is_wifi_driver_loaded() {
     char driver_status[PROPERTY_VALUE_MAX];
+    const char *wifi_driver_name = get_wifi_driver_name();
 #ifdef WIFI_DRIVER_MODULE_PATH
     FILE *proc;
     char line[sizeof(DRIVER_MODULE_TAG)+10];
@@ -238,7 +246,7 @@ int is_wifi_driver_loaded() {
         return 0;
     }
     while ((fgets(line, sizeof(line), proc)) != NULL) {
-        if (strncmp(line, DRIVER_MODULE_TAG, strlen(DRIVER_MODULE_TAG)) == 0) {
+        if (strncmp(line, wifi_driver_name, strlen(wifi_driver_name)) == 0) {
             fclose(proc);
             return 1;
         }
@@ -251,50 +259,100 @@ int is_wifi_driver_loaded() {
 #endif
 }
 
+int check_wifi_module_loaded(const char *wifi_module_name)
+{
+#define MODULE_LOADED_FILE_NAME	"/proc/modules"
+
+	FILE * fp = NULL;
+	char buf[512] = {0};
+	int ret = 0;
+
+	fp = fopen(MODULE_LOADED_FILE_NAME, "r");
+	if (NULL == fp)
+	{
+		return ret;
+	}
+
+	while(NULL != fgets(buf, sizeof(buf), fp))
+	{
+		if(NULL != strstr(buf, wifi_module_name))
+		{
+			ret = 1;
+			break;
+		}
+	}
+
+	fclose(fp);
+
+	return ret;
+
+#undef MODULE_LOADED_FILE_NAME
+}
+
+#define TIME_COUNT 40 // 200ms*40 = 8 seconds for completion
 int wifi_load_driver()
 {
 #ifdef WIFI_DRIVER_MODULE_PATH
     char driver_status[PROPERTY_VALUE_MAX];
-    int count = 100; /* wait at most 20 seconds for completion */
+    int  count = 0;
+    char tmp_buf[512] = {0};
+    char *p_strstr_wlan  = NULL;
+    int  ret        = 0;
+    FILE *fp        = NULL;
+    char module_path[128] = {0};
+    char module_arg[128] = {0};
 
-    if (is_wifi_driver_loaded()) {
-        return 0;
-    }
+    const char *wifi_driver_name = get_wifi_driver_name();
+    ALOGD("Start to insmod %s.ko\n", wifi_driver_name);
+    get_driver_module_arg(module_arg);
+    snprintf(module_path, sizeof(module_path), "%s%s.ko", WIFI_DRIVER_MODULE_PATH, wifi_driver_name);
+    ALOGD("module_arg=%s",module_arg);
+    ALOGD("module_path=%s",module_path);
 
-    if (insmod(DRIVER_MODULE_PATH, DRIVER_MODULE_ARG) < 0)
+	if(1 == check_wifi_module_loaded(wifi_driver_name))
+	{
+		ALOGE("wifi module:%s have been load, do not load again!", wifi_driver_name);
+		return 0;
+	}
+
+    if (insmod(module_path, module_arg) < 0) {
+        ALOGE("insmod %s ko failed!", wifi_driver_name);
+        rmmod(wifi_driver_name); //it may be load driver already,try remove it.
         return -1;
+    }
 
-    if (strcmp(FIRMWARE_LOADER,"") == 0) {
-        /* usleep(WIFI_DRIVER_LOADER_DELAY); */
-        property_set(DRIVER_PROP_NAME, "ok");
-    }
-    else {
-        property_set("ctl.start", FIRMWARE_LOADER);
-    }
-    sched_yield();
-    while (count-- > 0) {
-        if (property_get(DRIVER_PROP_NAME, driver_status, NULL)) {
-            if (strcmp(driver_status, "ok") == 0)
-                return 0;
-            else if (strcmp(driver_status, "failed") == 0) {
-                wifi_unload_driver();
-                return -1;
-            }
-        }
-        usleep(200000);
-    }
-    property_set(DRIVER_PROP_NAME, "timeout");
-    wifi_unload_driver();
-    return -1;
+    do{
+       fp=fopen("/proc/net/wireless", "r");
+       if (!fp) {
+           ALOGE("failed to fopen file: /proc/net/wireless\n");
+           property_set(DRIVER_PROP_NAME, "failed");
+           rmmod(wifi_driver_name); //try remove it.
+           return -1;
+       }
+       ret = fread(tmp_buf, sizeof(tmp_buf), 1, fp);
+       if (ret==0){
+           ALOGD("faied to read proc/net/wireless");
+       }
+       fclose(fp);
+
+       ALOGD("loading wifi driver...");
+       p_strstr_wlan = strstr(tmp_buf, "wlan0");
+       if (p_strstr_wlan != NULL) {
+           property_set(DRIVER_PROP_NAME, "ok");
+           break;
+       }
+       usleep(200000);// 200ms
+
+   } while (count++ <= TIME_COUNT);
+
+   if(count > TIME_COUNT) {
+       ALOGE("timeout, register netdevice wlan0 failed.");
+       property_set(DRIVER_PROP_NAME, "timeout");
+       rmmod(wifi_driver_name);
+       return -1;
+   }
+   return 0;
 #else
-#ifdef WIFI_DRIVER_STATE_CTRL_PARAM
-    if (is_wifi_driver_loaded()) {
-        return 0;
-    }
-
-    if (wifi_change_driver_state(WIFI_DRIVER_STATE_ON) < 0)
-        return -1;
-#endif
     property_set(DRIVER_PROP_NAME, "ok");
     return 0;
 #endif
@@ -302,29 +360,35 @@ int wifi_load_driver()
 
 int wifi_unload_driver()
 {
+    const char *wifi_vendor_name = get_wifi_vendor_name();
+
     usleep(200000); /* allow to finish interface down */
 #ifdef WIFI_DRIVER_MODULE_PATH
-    if (rmmod(DRIVER_MODULE_NAME) == 0) {
-        int count = 20; /* wait at most 10 seconds for completion */
-        while (count-- > 0) {
-            if (!is_wifi_driver_loaded())
-                break;
-            usleep(500000);
-        }
-        usleep(500000); /* allow card removal */
-        if (count) {
-            return 0;
-        }
-        return -1;
-    } else
-        return -1;
+	if(0 == check_wifi_module_loaded(get_wifi_driver_name()))
+	{
+	    if (rmmod(get_wifi_driver_name()) == 0) {
+	        int count = 20; /* wait at most 10 seconds for completion */
+	        while (count-- > 0) {
+	            if (!is_wifi_driver_loaded())
+	                break;
+	            usleep(500000);
+	        }
+	        usleep(500000); /* allow card removal */
+	        if (count) {
+	            return 0;
+	        }
+	        return -1;
+	    } else
+	        return -1;
+	}
+	else
+	{
+		ifc_disable("wlan0");
+
+		return 0;
+	}
+
 #else
-#ifdef WIFI_DRIVER_STATE_CTRL_PARAM
-    if (is_wifi_driver_loaded()) {
-        if (wifi_change_driver_state(WIFI_DRIVER_STATE_OFF) < 0)
-            return -1;
-    }
-#endif
     property_set(DRIVER_PROP_NAME, "unloaded");
     return 0;
 #endif
@@ -802,11 +866,11 @@ const char *wifi_get_fw_path(int fw_type)
 {
     switch (fw_type) {
     case WIFI_GET_FW_PATH_STA:
-        return WIFI_DRIVER_FW_PATH_STA;
+        return get_fw_path_sta();
     case WIFI_GET_FW_PATH_AP:
-        return WIFI_DRIVER_FW_PATH_AP;
+        return get_fw_path_ap();
     case WIFI_GET_FW_PATH_P2P:
-        return WIFI_DRIVER_FW_PATH_P2P;
+        return get_fw_path_p2p();
     }
     return NULL;
 }
@@ -816,10 +880,25 @@ int wifi_change_fw_path(const char *fwpath)
     int len;
     int fd;
     int ret = 0;
+    char wifi_driver_fw_patch_param[256] = {0};
+
+    ALOGD("Eneter: %s, fwpath = %s.\n", __FUNCTION__, fwpath);
+    if(strncmp(get_wifi_vendor_name(), "realtek", strlen("realtek")) == 0) {
+        return 0;
+    } else if(strncmp(get_wifi_vendor_name(), "xradio", strlen("xradio")) == 0) {
+        return 0;
+    } else if(strncmp(get_wifi_vendor_name(), "atheros", strlen("atheros")) == 0) {
+        return 0;
+    } else if(strncmp(get_wifi_vendor_name(), "broadcom", strlen("broadcom")) == 0) {
+        snprintf(wifi_driver_fw_patch_param, sizeof(wifi_driver_fw_patch_param),
+                "/sys/module/%s/parameters/firmware_path", get_wifi_driver_name());
+    } else {
+        strcpy(wifi_driver_fw_patch_param, WIFI_DRIVER_FW_PATH_PARAM);
+    }
 
     if (!fwpath)
         return ret;
-    fd = TEMP_FAILURE_RETRY(open(WIFI_DRIVER_FW_PATH_PARAM, O_WRONLY));
+    fd = TEMP_FAILURE_RETRY(open(wifi_driver_fw_patch_param, O_WRONLY));
     if (fd < 0) {
         ALOGE("Failed to open wlan fw path param (%s)", strerror(errno));
         return -1;

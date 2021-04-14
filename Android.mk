@@ -5,6 +5,7 @@ legacy_modules := power uevent wifi qemu qemu_tracing
 
 SAVE_MAKEFILES := $(call all-named-subdir-makefiles,$(legacy_modules))
 LEGACY_AUDIO_MAKEFILES := $(call all-named-subdir-makefiles,audio)
+LEGACY_WIFI_HARDWARE_INFO_MAKEFILES := $(call all-named-subdir-makefiles, wifi_hardware_info)
 
 LOCAL_PATH:= $(call my-dir)
 include $(CLEAR_VARS)
@@ -21,6 +22,7 @@ LOCAL_SHARED_LIBRARIES += libdl
 
 include $(SAVE_MAKEFILES)
 
+LOCAL_STATIC_LIBRARIES += libwifi_hardware_info
 LOCAL_MODULE:= libhardware_legacy
 
 include $(BUILD_SHARED_LIBRARY)
@@ -52,3 +54,4 @@ include $(BUILD_SHARED_LIBRARY)
 # legacy_audio builds it's own set of libraries that aren't linked into
 # hardware_legacy
 include $(LEGACY_AUDIO_MAKEFILES)
+include $(LEGACY_WIFI_HARDWARE_INFO_MAKEFILES)
